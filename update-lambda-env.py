@@ -22,12 +22,12 @@ def change_lambda_env(lambda_name):
     response = _lambda.get_function_configuration(FunctionName=lambda_name)
     cur_envs = response['Environment']['Variables']
 
-    cur_envs['llm_model_endpoint'] = chatglm_endpoint # default to ''
+    cur_envs['llm_model_endpoint'] = chatglm_endpoint
     cur_envs['embedding_endpoint'] = bge_endpoint # default to 'cohere.embed-multilingual-v3'
 
-    # update lambda function 'Ask_Assistant' enviroment config
+    # update lambda function enviroment config
     _lambda.update_function_configuration(
-        FunctionName='Ask_Assistant',
+        FunctionName=lambda_name,
         Environment={
             'Variables': cur_envs
         },
