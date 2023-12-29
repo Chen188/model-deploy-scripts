@@ -1,6 +1,6 @@
 run:
 
-`python deploy-chatglm.py [region-name]` 
+`python setup.py [region-name]` 
 
 e.g:
-`python deploy-chatglm.py us-west-2`
+`python setup.py us-west-2`
