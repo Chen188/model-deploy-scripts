@@ -11,8 +11,7 @@ except:
     raise("You've to provide region code, e.g. us-west-2")
 
 # install pip requirements
-print('installing pip requirements...')
-os.system('pip install sagemaker huggingface-hub -Uqq')
+# os.system('pip install sagemaker huggingface-hub -Uqq')
 
 from utils import *
 
@@ -32,7 +31,7 @@ bucket = cfn_outpus.get('UPLOADBUCKET')
 account_id = bucket.split('-')[0]
 
 # download model
-def download_model(model_id='THUDM/chatglm3-6b', commit_hash = "e46a14881eae613281abbd266ee918e93a56018f"):
+def download_model(model_id='BAAI/bge-large-zh-v1.5', commit_hash = "00f8ffc4928a685117583e2a38af8ebb65dcec2c"):
     from huggingface_hub import snapshot_download
     from pathlib import Path
 
@@ -99,8 +98,10 @@ import torch
 import logging
 import math
 import os
+from FlagEmbedding import FlagModel
 
-from transformers import pipeline, AutoModel, AutoTokenizer
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+print(f'--device={device}')
 
 def load_model(properties):
     tensor_parallel = properties["tensor_parallel_degree"]
@@ -108,41 +109,41 @@ def load_model(properties):
     if "model_id" in properties:
         model_location = properties['model_id']
     logging.info(f"Loading model in {model_location}")
-    
-    tokenizer = AutoTokenizer.from_pretrained(model_location, trust_remote_code=True)
-   
-    model = AutoModel.from_pretrained(model_location, trust_remote_code=True).half().cuda()
-    
-    # model.requires_grad_(False)
-    # model.eval()
-    
-    return model, tokenizer
 
+    model =  FlagModel(model_location)
+    
+    return model
 
 model = None
-tokenizer = None
-generator = None
-
 
 def handle(inputs: Input):
-    global model, tokenizer
+    global model
     if not model:
-        model, tokenizer = load_model(inputs.get_properties())
+        model = load_model(inputs.get_properties())
 
     if inputs.is_empty():
         return None
     data = inputs.get_as_json()
     
-    input_sentences = data["inputs"]
-    params = data["parameters"]
-    history = data["history"]
+    input_sentences = None
+    inputs = data["inputs"]
+    if isinstance(inputs, list):
+        input_sentences = inputs
+    else:
+        input_sentences =  [inputs]
+        
+    is_query = data["is_query"]
+    instruction = data["instruction"]
+    logging.info(f"inputs: {input_sentences}")
+    logging.info(f"is_query: {is_query}")
+    logging.info(f"instruction: {instruction}")
     
-    # chat(tokenizer, query: str, history: List[Tuple[str, str]] = None, 
-    # max_length: int = 2048, num_beams=1, do_sample=True, top_p=0.7, 
-    # temperature=0.95, logits_processor=None, **kwargs)
-    response, history = model.chat(tokenizer, input_sentences, history=history, **params)
-    
-    result = {"outputs": response, "history" : history}
+    if is_query and instruction:
+        input_sentences = [ instruction + sent for sent in input_sentences ]
+        
+    sentence_embeddings =  model.encode(input_sentences)
+        
+    result = {"sentence_embeddings": sentence_embeddings}
     return Output().add_as_json(result)
     """)
 
@@ -156,7 +157,8 @@ option.s3url = s3://{bucket}/{s3_model_prefix}/
         """)
 
     with open(f'{local_code_folder_name}/requirements.txt', 'w') as f:
-        f.write(f"""transformers==4.28.1""")
+        f.write(f"""transformers==4.28.1
+FlagEmbedding""")
 
     s3_code_artifact = f's3://{bucket}/{s3_code_prefix}/model.tar.gz'
     os.system(f"""
@@ -176,7 +178,7 @@ def create_llm_model(model_id, s3_code_artifact, iam_role_arn):
         f"763104351884.dkr.ecr.{region}.amazonaws.com/djl-inference:0.23.0-deepspeed0.9.5-cu118"
     )
 
-    model_name = name_from_base(model_id.replace('/', '-'))
+    model_name = name_from_base(model_id.replace('/', '-').replace('.', ''))
     print(model_name)
     print(f"Image going to be used is ----> {inference_image_uri}")
 
@@ -206,7 +208,7 @@ def create_endpoint(model_name, iam_role_arn):
             {
                 "VariantName": "variant1",
                 "ModelName": model_name,
-                "InstanceType": "ml.g4dn.2xlarge",
+                "InstanceType": "ml.g5.2xlarge",
                 "InitialInstanceCount": 1,
                 # "VolumeSizeInGB" : 400,
                 # "ModelDataDownloadTimeoutInSeconds": 2400,
@@ -224,8 +226,8 @@ def create_endpoint(model_name, iam_role_arn):
     status = resp["EndpointStatus"]
     print("Status: " + status)
 
-    with open('chatglm-sagemaker-endpoint.txt', 'w') as f:
-        print('saving endpoint name to chatglm-sagemaker-endpoint.txt')
+    with open('bge-sagemaker-endpoint.txt', 'w') as f:
+        print('saving endpoint name to bge-sagemaker-endpoint.txt')
         f.write(endpoint_name)
 
     while status == "Creating":
@@ -239,34 +241,38 @@ def create_endpoint(model_name, iam_role_arn):
 
     return endpoint_name
 
-def test_llm_model(endpoint_name):
+
+def get_vector_by_sm_endpoint(questions, sm_client, endpoint_name, language='zh'):
     parameters = {
-        "max_length": 2048,
-        "temperature": 0.01,
-        "num_beams": 1, # >1可能会报错，"probability tensor contains either `inf`, `nan` or element < 0"； 即使remove_invalid_values=True也不能解决
-        "do_sample": False,
-        "top_p": 0.7,
-        "logits_processor" : None,
-        # "remove_invalid_values" : True
     }
 
-    prompts1 = """AWS Clean Rooms 的FAQ文档有提到 Q: 是否发起者和数据贡献者都会被收费？A: 是单方收费，只有查询的接收方会收费。
-请问AWS Clean Rooms是多方都会收费吗？
-    """
-    response_model = smr_client.invoke_endpoint(
-                EndpointName=endpoint_name,
-                Body=json.dumps(
-                {
-                    "inputs": prompts1,
-                    "parameters": parameters,
-                    "history" : []
-                }
-                ),
-                ContentType="application/json",
-            )
+    if language == 'zh':
+        instruction =  "为这个句子生成表示以用于检索相关文章："
+    else:
+        instruction =  "Represent this sentence for searching relevant passages:"
 
-    resp = response_model['Body'].read().decode('utf8')
-    print(resp)
+    response_model = sm_client.invoke_endpoint(
+        EndpointName=endpoint_name,
+        Body=json.dumps(
+            {
+                "inputs": questions,
+                "is_query": True,
+                "instruction" :  language
+            }
+        ),
+        ContentType="application/json",
+    )
+    # 中文instruction => 为这个句子生成表示以用于检索相关文章：
+    json_str = response_model['Body'].read().decode('utf8')
+    json_obj = json.loads(json_str)
+    embeddings = json_obj['sentence_embeddings']
+    return embeddings
+
+def test_llm_model(endpoint_name):
+    prompts1 = ["你好啊"]
+
+    emb = get_vector_by_sm_endpoint(prompts1, smr_client, endpoint_name)
+    print(f'text: {prompts1}\nembedding: emb[0][:10]')
 
 
 if __name__ == "__main__":
@@ -276,11 +282,11 @@ if __name__ == "__main__":
         iam_role_arn = get_sm_role_arn()
         pass
 
-    model_id = 'THUDM/chatglm3-6b'
+    model_id = 'BAAI/bge-large-zh-v1.5'
     local_code_folder_name, local_model_folder_name, s3_code_prefix, s3_model_prefix = \
-        download_model(model_id, "e46a14881eae613281abbd266ee918e93a56018f")
+        download_model(model_id, "00f8ffc4928a685117583e2a38af8ebb65dcec2c")
     s3_code_artifact = create_llm_model_artifact(local_code_folder_name, s3_model_prefix, s3_code_prefix)
-    
+
     model_arn, model_name = create_llm_model(model_id, s3_code_artifact, iam_role_arn)
     endpoint_name = create_endpoint(model_name, iam_role_arn)
     test_llm_model(endpoint_name)
