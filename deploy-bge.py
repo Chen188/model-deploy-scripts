@@ -11,7 +11,7 @@ except:
     raise("You've to provide region code, e.g. us-west-2")
 
 # install pip requirements
-# os.system('pip install sagemaker huggingface-hub -Uqq')
+os.system('pip install sagemaker huggingface-hub -Uqq')
 
 from utils import *
 
