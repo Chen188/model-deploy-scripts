@@ -192,7 +192,7 @@ def create_llm_model(model_id, s3_code_artifact, iam_role_arn):
 
     print(f"Created Model: {model_arn}")
 
-    sleep(1) # sleep before return
+    time.sleep(1) # sleep before return
     return model_arn, model_name
 
 def create_endpoint(model_name, iam_role_arn):
